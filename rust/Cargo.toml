@@ -1,0 +1,14 @@
+[package]
+name = "spsc-ring"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+description = "Bounded, wait-free single-producer/single-consumer ring buffer"
+repository = "https://github.com/groovg/spsc-ring"
+readme = "README.md"
+keywords = ["spsc", "lock-free", "queue", "ring-buffer", "low-latency"]
+categories = ["concurrency", "data-structures"]
+
+[lib]
+name = "spsc_ring"
