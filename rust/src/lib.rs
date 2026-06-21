@@ -43,40 +43,49 @@ impl<T: Copy + Default> Ring<T> {
     }
 
     /// Push one element. Returns `false` if the ring is full.
+    ///
+    /// Only the producer writes `tail`, so its own value can be read `Relaxed`.
+    /// `head` is loaded `Acquire` to synchronize with the consumer's release of a
+    /// freed slot, and the new `tail` is published `Release` so the element store
+    /// above it is visible to the consumer's matching `Acquire` load.
     pub fn push(&self, item: T) -> bool {
-        let tail = self.tail.load(Ordering::SeqCst);
-        let head = self.head.load(Ordering::SeqCst);
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
         if tail.wrapping_sub(head) == self.capacity() {
             return false;
         }
         unsafe {
             *self.slots[tail & self.mask].get() = item;
         }
-        self.tail.store(tail.wrapping_add(1), Ordering::SeqCst);
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
         true
     }
 
     /// Pop one element. Returns `None` if the ring is empty.
+    ///
+    /// Mirror of [`push`](Self::push): `head` is the consumer's own index
+    /// (`Relaxed`), `tail` is `Acquire` to observe the producer's published
+    /// element, and the advanced `head` is released to free the slot.
     pub fn pop(&self) -> Option<T> {
-        let head = self.head.load(Ordering::SeqCst);
-        let tail = self.tail.load(Ordering::SeqCst);
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
         if head == tail {
             return None;
         }
         let item = unsafe { *self.slots[head & self.mask].get() };
-        self.head.store(head.wrapping_add(1), Ordering::SeqCst);
+        self.head.store(head.wrapping_add(1), Ordering::Release);
         Some(item)
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.head.load(Ordering::SeqCst) == self.tail.load(Ordering::SeqCst)
+        self.len() == 0
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        let tail = self.tail.load(Ordering::SeqCst);
-        let head = self.head.load(Ordering::SeqCst);
+        let tail = self.tail.load(Ordering::Acquire);
+        let head = self.head.load(Ordering::Acquire);
         tail.wrapping_sub(head)
     }
 }
@@ -109,6 +118,42 @@ mod tests {
         }
         assert_eq!(ring.pop(), None);
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn single_producer_single_consumer_threads() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const N: u64 = 1_000_000;
+        let ring = Arc::new(Ring::<u64>::with_capacity(1024));
+
+        let producer = {
+            let ring = Arc::clone(&ring);
+            thread::spawn(move || {
+                for i in 0..N {
+                    while !ring.push(i) {
+                        std::hint::spin_loop();
+                    }
+                }
+            })
+        };
+
+        let consumer = thread::spawn(move || {
+            let mut next = 0u64;
+            while next < N {
+                match ring.pop() {
+                    Some(v) => {
+                        assert_eq!(v, next, "values must arrive in order, no gaps or dupes");
+                        next += 1;
+                    }
+                    None => std::hint::spin_loop(),
+                }
+            }
+        });
+
+        producer.join().unwrap();
+        consumer.join().unwrap();
     }
 
     #[test]
