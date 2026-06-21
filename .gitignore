@@ -1,0 +1,14 @@
+# Rust
+/rust/target
+/rust/Cargo.lock
+
+# C++ / CMake
+/cpp/build
+/cpp/cmake-build-*
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
