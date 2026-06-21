@@ -5,13 +5,29 @@
 //! counter rather than a modulo.
 
 use std::cell::UnsafeCell;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Pads its contents to a full cache line so two fields written by different
+/// cores never land on the same line. Without this, the producer's store to
+/// `tail` and the consumer's store to `head` ping-pong the same line between
+/// cores (false sharing).
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+impl<T> Deref for CachePadded<T> {
+    type Target = T;
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
 
 pub struct Ring<T> {
     slots: Box<[UnsafeCell<T>]>,
     mask: usize,
-    head: AtomicUsize,
-    tail: AtomicUsize,
+    head: CachePadded<AtomicUsize>,
+    tail: CachePadded<AtomicUsize>,
 }
 
 // A single producer and a single consumer touch disjoint indices, so the only
@@ -32,8 +48,8 @@ impl<T: Copy + Default> Ring<T> {
         Self {
             slots,
             mask: cap - 1,
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
+            head: CachePadded(AtomicUsize::new(0)),
+            tail: CachePadded(AtomicUsize::new(0)),
         }
     }
 
