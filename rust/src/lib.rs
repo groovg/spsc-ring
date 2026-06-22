@@ -5,6 +5,7 @@
 //! counter rather than a modulo.
 
 use std::cell::UnsafeCell;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -24,7 +25,7 @@ impl<T> Deref for CachePadded<T> {
 }
 
 pub struct Ring<T> {
-    slots: Box<[UnsafeCell<T>]>,
+    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
     mask: usize,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
@@ -40,14 +41,14 @@ pub struct Ring<T> {
 unsafe impl<T: Send> Sync for Ring<T> {}
 unsafe impl<T: Send> Send for Ring<T> {}
 
-impl<T: Copy + Default> Ring<T> {
+impl<T> Ring<T> {
     /// Create a ring that can hold at least `capacity` elements. The real capacity
     /// is `capacity` rounded up to the next power of two.
     pub fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity must be non-zero");
         let cap = capacity.next_power_of_two();
         let slots = (0..cap)
-            .map(|_| UnsafeCell::new(T::default()))
+            .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
@@ -84,7 +85,7 @@ impl<T: Copy + Default> Ring<T> {
             }
         }
         unsafe {
-            *self.slots[tail & self.mask].get() = item;
+            (*self.slots[tail & self.mask].get()).write(item);
         }
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         true
@@ -106,7 +107,7 @@ impl<T: Copy + Default> Ring<T> {
                 return None;
             }
         }
-        let item = unsafe { *self.slots[head & self.mask].get() };
+        let item = unsafe { (*self.slots[head & self.mask].get()).assume_init_read() };
         self.head.store(head.wrapping_add(1), Ordering::Release);
         Some(item)
     }
@@ -121,6 +122,22 @@ impl<T: Copy + Default> Ring<T> {
         let tail = self.tail.load(Ordering::Acquire);
         let head = self.head.load(Ordering::Acquire);
         tail.wrapping_sub(head)
+    }
+}
+
+impl<T> Drop for Ring<T> {
+    fn drop(&mut self) {
+        // Slots in `[head, tail)` were written but never popped; drop them.
+        // Uninitialized slots are left untouched. By the time `drop` runs we have
+        // `&mut self`, so the indices can be read non-atomically.
+        let mut head = *self.head.0.get_mut();
+        let tail = *self.tail.0.get_mut();
+        while head != tail {
+            unsafe {
+                (*self.slots[head & self.mask].get()).assume_init_drop();
+            }
+            head = head.wrapping_add(1);
+        }
     }
 }
 
@@ -152,6 +169,42 @@ mod tests {
         }
         assert_eq!(ring.pop(), None);
         assert!(ring.is_empty());
+    }
+
+    #[test]
+    fn handles_non_copy_payload() {
+        let ring = Ring::<String>::with_capacity(4);
+        assert!(ring.push("hello".to_string()));
+        assert!(ring.push("world".to_string()));
+        assert_eq!(ring.pop().as_deref(), Some("hello"));
+        assert_eq!(ring.pop().as_deref(), Some("world"));
+        assert!(ring.pop().is_none());
+    }
+
+    #[test]
+    fn drops_each_element_exactly_once() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        struct Counted(Arc<AtomicUsize>);
+        impl Drop for Counted {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let ring = Ring::<Counted>::with_capacity(8);
+            for _ in 0..5 {
+                assert!(ring.push(Counted(Arc::clone(&drops))));
+            }
+            // Two are popped (dropped here); three are left for Ring::drop.
+            drop(ring.pop().unwrap());
+            drop(ring.pop().unwrap());
+            assert_eq!(drops.load(Ordering::SeqCst), 2);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 5);
     }
 
     #[test]
