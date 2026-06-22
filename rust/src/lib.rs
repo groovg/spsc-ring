@@ -28,6 +28,11 @@ pub struct Ring<T> {
     mask: usize,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
+    // Each side caches the other index so the common case never touches the
+    // remote atomic. `head_cache` is read/written only by the producer,
+    // `tail_cache` only by the consumer — no cross-thread sharing.
+    head_cache: CachePadded<UnsafeCell<usize>>,
+    tail_cache: CachePadded<UnsafeCell<usize>>,
 }
 
 // A single producer and a single consumer touch disjoint indices, so the only
@@ -50,6 +55,8 @@ impl<T: Copy + Default> Ring<T> {
             mask: cap - 1,
             head: CachePadded(AtomicUsize::new(0)),
             tail: CachePadded(AtomicUsize::new(0)),
+            head_cache: CachePadded(UnsafeCell::new(0)),
+            tail_cache: CachePadded(UnsafeCell::new(0)),
         }
     }
 
@@ -61,14 +68,20 @@ impl<T: Copy + Default> Ring<T> {
     /// Push one element. Returns `false` if the ring is full.
     ///
     /// Only the producer writes `tail`, so its own value can be read `Relaxed`.
-    /// `head` is loaded `Acquire` to synchronize with the consumer's release of a
-    /// freed slot, and the new `tail` is published `Release` so the element store
-    /// above it is visible to the consumer's matching `Acquire` load.
+    /// The free space is checked against the cached `head` first; the real `head`
+    /// atomic (loaded `Acquire`, synchronizing with the consumer's release of a
+    /// freed slot) is only read when the cache claims the ring is full. The new
+    /// `tail` is published `Release` so the element store is visible to the
+    /// consumer's matching `Acquire` load.
     pub fn push(&self, item: T) -> bool {
         let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
+        let mut head = unsafe { *self.head_cache.get() };
         if tail.wrapping_sub(head) == self.capacity() {
-            return false;
+            head = self.head.load(Ordering::Acquire);
+            unsafe { *self.head_cache.get() = head };
+            if tail.wrapping_sub(head) == self.capacity() {
+                return false;
+            }
         }
         unsafe {
             *self.slots[tail & self.mask].get() = item;
@@ -80,13 +93,18 @@ impl<T: Copy + Default> Ring<T> {
     /// Pop one element. Returns `None` if the ring is empty.
     ///
     /// Mirror of [`push`](Self::push): `head` is the consumer's own index
-    /// (`Relaxed`), `tail` is `Acquire` to observe the producer's published
-    /// element, and the advanced `head` is released to free the slot.
+    /// (`Relaxed`), emptiness is checked against the cached `tail` first, and the
+    /// real `tail` atomic is loaded `Acquire` (observing the producer's published
+    /// element) only when the cache claims the ring is empty.
     pub fn pop(&self) -> Option<T> {
         let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
+        let mut tail = unsafe { *self.tail_cache.get() };
         if head == tail {
-            return None;
+            tail = self.tail.load(Ordering::Acquire);
+            unsafe { *self.tail_cache.get() = tail };
+            if head == tail {
+                return None;
+            }
         }
         let item = unsafe { *self.slots[head & self.mask].get() };
         self.head.store(head.wrapping_add(1), Ordering::Release);
