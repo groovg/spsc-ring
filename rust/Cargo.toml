@@ -12,3 +12,23 @@ categories = ["concurrency", "data-structures"]
 
 [lib]
 name = "spsc_ring"
+
+[dev-dependencies]
+criterion = "0.5"
+rtrb = "0.3"
+crossbeam-queue = "0.3"
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[[bench]]
+name = "throughput"
+harness = false
+
+[[bench]]
+name = "latency_rtt"
+harness = false
+
+[profile.bench]
+lto = true
+codegen-units = 1
