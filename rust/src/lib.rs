@@ -5,12 +5,47 @@
 //! counter rather than a modulo.
 
 use std::cell::Cell;
-use std::cell::UnsafeCell;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+
+use sync::{Arc, AtomicUsize, Ordering, UnsafeCell};
+
+#[cfg(not(loom))]
+mod sync {
+    pub use std::sync::atomic::{AtomicUsize, Ordering};
+    pub use std::sync::Arc;
+
+    /// Gives `std`'s `UnsafeCell` the same `with`/`with_mut` access API that
+    /// `loom`'s instrumented cell exposes, so the ring body is byte-for-byte the
+    /// same in the real build and under the loom model.
+    #[derive(Debug)]
+    pub struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
+
+    impl<T> UnsafeCell<T> {
+        #[inline]
+        pub fn new(value: T) -> Self {
+            Self(std::cell::UnsafeCell::new(value))
+        }
+
+        #[inline]
+        pub fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
+            f(self.0.get())
+        }
+
+        #[inline]
+        pub fn with_mut<R>(&self, f: impl FnOnce(*mut T) -> R) -> R {
+            f(self.0.get())
+        }
+    }
+}
+
+#[cfg(loom)]
+mod sync {
+    pub use loom::cell::UnsafeCell;
+    pub use loom::sync::atomic::{AtomicUsize, Ordering};
+    pub use loom::sync::Arc;
+}
 
 /// Pads its contents to a full cache line so two fields written by different
 /// cores never land on the same line. Without this, the producer's store to
@@ -80,17 +115,15 @@ impl<T> Ring<T> {
     /// consumer's matching `Acquire` load.
     pub fn push(&self, item: T) -> Result<(), T> {
         let tail = self.tail.load(Ordering::Relaxed);
-        let mut head = unsafe { *self.head_cache.get() };
+        let mut head = self.head_cache.with(|p| unsafe { *p });
         if tail.wrapping_sub(head) == self.capacity() {
             head = self.head.load(Ordering::Acquire);
-            unsafe { *self.head_cache.get() = head };
+            self.head_cache.with_mut(|p| unsafe { *p = head });
             if tail.wrapping_sub(head) == self.capacity() {
                 return Err(item);
             }
         }
-        unsafe {
-            (*self.slots[tail & self.mask].get()).write(item);
-        }
+        self.slots[tail & self.mask].with_mut(|p| unsafe { (*p).write(item) });
         self.tail.store(tail.wrapping_add(1), Ordering::Release);
         Ok(())
     }
@@ -103,15 +136,15 @@ impl<T> Ring<T> {
     /// element) only when the cache claims the ring is empty.
     pub fn pop(&self) -> Option<T> {
         let head = self.head.load(Ordering::Relaxed);
-        let mut tail = unsafe { *self.tail_cache.get() };
+        let mut tail = self.tail_cache.with(|p| unsafe { *p });
         if head == tail {
             tail = self.tail.load(Ordering::Acquire);
-            unsafe { *self.tail_cache.get() = tail };
+            self.tail_cache.with_mut(|p| unsafe { *p = tail });
             if head == tail {
                 return None;
             }
         }
-        let item = unsafe { (*self.slots[head & self.mask].get()).assume_init_read() };
+        let item = self.slots[head & self.mask].with_mut(|p| unsafe { (*p).assume_init_read() });
         self.head.store(head.wrapping_add(1), Ordering::Release);
         Some(item)
     }
@@ -132,14 +165,12 @@ impl<T> Ring<T> {
 impl<T> Drop for Ring<T> {
     fn drop(&mut self) {
         // Slots in `[head, tail)` were written but never popped; drop them.
-        // Uninitialized slots are left untouched. By the time `drop` runs we have
-        // `&mut self`, so the indices can be read non-atomically.
-        let mut head = *self.head.0.get_mut();
-        let tail = *self.tail.0.get_mut();
+        // Uninitialized slots are left untouched. `drop` has exclusive access, so
+        // a relaxed load of each index is enough.
+        let mut head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
         while head != tail {
-            unsafe {
-                (*self.slots[head & self.mask].get()).assume_init_drop();
-            }
+            self.slots[head & self.mask].with_mut(|p| unsafe { (*p).assume_init_drop() });
             head = head.wrapping_add(1);
         }
     }

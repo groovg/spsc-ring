@@ -13,12 +13,15 @@ categories = ["concurrency", "data-structures"]
 [lib]
 name = "spsc_ring"
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
 [dev-dependencies]
 criterion = "0.5"
 rtrb = "0.3"
 crossbeam-queue = "0.3"
 
-[target.'cfg(loom)'.dev-dependencies]
+[target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 [[bench]]
