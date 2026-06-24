@@ -6,37 +6,47 @@ Header-only, bounded, wait-free single-producer/single-consumer ring buffer
 ```cpp
 #include "spsc/ring_buffer.hpp"
 
-spsc::Ring<std::uint64_t> ring(1024);
+auto [tx, rx] = spsc::channel<std::uint64_t>(1024);
 
-// producer thread
+// producer thread (owns tx)
 for (std::uint64_t i = 0; i < 1000; ++i) {
-    while (!ring.push(i)) {
+    while (!tx.push(i)) {
         // spin until the consumer frees a slot
     }
 }
 
-// consumer thread
+// consumer thread (owns rx)
 std::uint64_t value;
-while (ring.pop(value)) {
+while (rx.pop(value)) {
     use(value);
 }
 ```
 
-`push` returns `false` when full, `pop` returns `false` when empty. Capacity is
-rounded up to a power of two and nothing allocates after construction.
+`channel<T>(capacity)` returns a `Producer` / `Consumer` pair (move-only, one per
+thread). `push` returns `false` when full, `pop` returns `false` when empty.
+Capacity is rounded up to a power of two and nothing allocates after construction.
 
 ## Design
 
 - Free-running `head`/`tail` counters indexed with a bitmask (no modulo, no
   "is full" flag).
+- The buffer and the two published atomics live in a shared `Ring`; each handle
+  owns its index, a cached copy of the peer's index, a raw slot pointer and the
+  mask, so that per-thread state stays in registers across the hot loop.
 - Minimal acquire/release ordering: the producer publishes `tail` with `release`,
   the consumer reads it with `acquire`; `head` mirrors.
-- `head` and `tail` are `alignas(64)` on separate cache lines; each shares its
-  line with the cache the same thread uses, so a hot `push`/`pop` touches one line.
-- Each side caches the other's index and only reads the remote atomic when the
-  cache says full/empty.
-- Slots are raw union storage: `push` placement-news the element, `pop` moves it
-  out and runs the destructor, so any `T` works and destructors fire exactly once.
+- The two published atomics are `alignas(64)` on separate cache lines.
+- Slots are raw union storage: `push` placement-news the element; `pop` moves it
+  out and, for non-trivially-destructible `T`, runs the destructor (`if constexpr`
+  elides it otherwise). Any `T` works and destructors fire exactly once.
+
+## Why C++20 (not 23 / 26)
+
+C++20 is the deliberate baseline — it is what downstream users are on in 2026, and
+nothing here needs more. C++26 is not yet a viable dependency (feature-frozen 2025,
+publication 2026–2027, partial toolchain support), and the C++23 features that were
+evaluated (`[[assume]]`, `std::start_lifetime_as`) buy nothing once the slot pointer
+is hoisted and storage is a union. See the [repository README](../README.md#why-c20-and-not-23-or-26).
 
 ## Build, test, benchmark
 

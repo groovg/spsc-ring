@@ -5,7 +5,7 @@ Bounded, wait-free single-producer/single-consumer ring buffer.
 ```rust
 use spsc_ring::channel;
 
-let (tx, rx) = channel::<u64>(1024);
+let (mut tx, mut rx) = channel::<u64>(1024);
 
 std::thread::spawn(move || {
     for i in 0..1000 {
@@ -29,18 +29,18 @@ hands the value back as `Err(item)` when the ring is full; `pop` returns `None`
 when empty. Capacity is rounded up to a power of two and nothing allocates after
 construction.
 
-The lower-level `Ring<T>` is also public if you want to manage sharing yourself.
-
 ## Design
 
 - Free-running `head`/`tail` counters indexed with a bitmask (no modulo, no
   "is full" flag).
+- Each endpoint owns its index, a cached copy of the peer's index, a raw pointer
+  to the buffer, and the mask. That state is thread-local, so the compiler keeps
+  it in registers across the hot loop and `push`/`pop` never read a shared atomic
+  for their own bookkeeping.
 - Minimal acquire/release ordering: the producer publishes `tail` with `Release`,
   the consumer reads it with `Acquire`; `head` mirrors. That single edge is what
   makes a written slot visible before its index is.
-- `head` and `tail` sit on separate cache lines to avoid false sharing.
-- Each side caches the other's index and only touches the remote atomic when the
-  cache says full/empty, removing almost all coherency traffic in steady state.
+- The two published atomics sit on separate cache lines to avoid false sharing.
 - Elements live in `MaybeUninit`, so any `T` is supported and destructors run
   exactly once (verified with a drop-counting test).
 
