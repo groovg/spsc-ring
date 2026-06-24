@@ -7,6 +7,12 @@
 
 namespace spsc {
 
+// Cache line size used to keep the producer's and consumer's indices apart.
+// Hardcoded to 64 (every current x86-64 and AArch64 line) instead of
+// std::hardware_destructive_interference_size, which gcc warns can change between
+// compiler versions and so is unsafe to bake into anything ABI-facing.
+inline constexpr std::size_t kCacheLine = 64;
+
 // Bounded, wait-free single-producer/single-consumer ring buffer.
 //
 // One thread calls push, exactly one other calls pop. Capacity is fixed at
@@ -69,8 +75,12 @@ private:
     std::size_t capacity_;
     std::size_t mask_;
     std::vector<T> slots_;
-    std::atomic<std::size_t> head_{0};
-    std::atomic<std::size_t> tail_{0};
+
+    // head and tail live on separate cache lines: otherwise the producer's store
+    // to tail and the consumer's store to head keep invalidating the same line
+    // on the other core (false sharing).
+    alignas(kCacheLine) std::atomic<std::size_t> head_{0};
+    alignas(kCacheLine) std::atomic<std::size_t> tail_{0};
 };
 
 }  // namespace spsc
