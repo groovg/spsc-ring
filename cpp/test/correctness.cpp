@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <thread>
 
 #include "check.hpp"
 #include "spsc/ring_buffer.hpp"
@@ -39,6 +40,35 @@ int main() {
             CHECK(value == round);
         }
         CHECK(ring.empty());
+    }
+
+    {
+        // Producer and consumer on separate threads: values must arrive in order
+        // with no gaps or duplicates.
+        constexpr uint64_t kCount = 2'000'000;
+        Ring<uint64_t> ring(1024);
+
+        std::thread producer([&] {
+            for (uint64_t i = 0; i < kCount; ++i) {
+                while (!ring.push(i)) {
+                    // spin until the consumer frees a slot
+                }
+            }
+        });
+
+        uint64_t next = 0;
+        uint64_t value = 0;
+        while (next < kCount) {
+            if (ring.pop(value)) {
+                if (value != next) {
+                    CHECK(value == next);
+                    break;
+                }
+                ++next;
+            }
+        }
+        producer.join();
+        CHECK(next == kCount);
     }
 
     RUN_END();
