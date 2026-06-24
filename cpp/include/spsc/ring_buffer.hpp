@@ -37,9 +37,13 @@ public:
     // to the consumer's matching acquire load.
     bool push(const T& item) {
         const std::size_t tail = tail_.load(std::memory_order_relaxed);
-        const std::size_t head = head_.load(std::memory_order_acquire);
-        if (tail - head == capacity_) {
-            return false;
+        // Check space against the cached head first; only reload the real atomic
+        // (paying a cross-core read) when the cache claims the ring is full.
+        if (tail - head_cache_ == capacity_) {
+            head_cache_ = head_.load(std::memory_order_acquire);
+            if (tail - head_cache_ == capacity_) {
+                return false;
+            }
         }
         slots_[tail & mask_] = item;
         tail_.store(tail + 1, std::memory_order_release);
@@ -53,9 +57,11 @@ public:
     // released to free the slot.
     bool pop(T& out) {
         const std::size_t head = head_.load(std::memory_order_relaxed);
-        const std::size_t tail = tail_.load(std::memory_order_acquire);
-        if (head == tail) {
-            return false;
+        if (head == tail_cache_) {
+            tail_cache_ = tail_.load(std::memory_order_acquire);
+            if (head == tail_cache_) {
+                return false;
+            }
         }
         out = slots_[head & mask_];
         head_.store(head + 1, std::memory_order_release);
@@ -78,9 +84,12 @@ private:
 
     // head and tail live on separate cache lines: otherwise the producer's store
     // to tail and the consumer's store to head keep invalidating the same line
-    // on the other core (false sharing).
+    // on the other core (false sharing). Each index shares its line with the
+    // cache used by the same thread, so a hot push/pop touches only its own line.
     alignas(kCacheLine) std::atomic<std::size_t> head_{0};
+    std::size_t tail_cache_ = 0;  // consumer-only copy of tail
     alignas(kCacheLine) std::atomic<std::size_t> tail_{0};
+    std::size_t head_cache_ = 0;  // producer-only copy of head
 };
 
 }  // namespace spsc
