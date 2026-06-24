@@ -1,28 +1,50 @@
-//! Sustained two-thread throughput: a producer pins values into the ring while a
-//! consumer drains them. Measures the same workload across this crate, `rtrb`,
-//! and `crossbeam`'s `ArrayQueue` so the numbers are directly comparable.
+//! Sustained two-thread throughput, this crate vs rtrb vs crossbeam's ArrayQueue.
+//!
+//! Both threads are pinned to distinct physical cores on the same CCD, and the
+//! channel allocation and thread spawn happen before the timed region (a barrier
+//! starts the clock only once both sides are ready). Reports the median of 15 runs.
 
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-
-const ITEMS: u64 = 4_000_000;
+const ITEMS: u64 = 50_000_000;
 const CAPACITY: usize = 1024;
+const PRODUCER_CORE: usize = 0;
+const CONSUMER_CORE: usize = 2;
+const RUNS: usize = 15;
 
-fn spsc_ring_run() -> Duration {
-    let (tx, rx) = spsc_ring::channel::<u64>(CAPACITY);
-    let start = Instant::now();
-    let producer = thread::spawn(move || {
-        for i in 0..ITEMS {
-            let mut item = i;
-            while let Err(returned) = tx.push(item) {
-                item = returned;
-                std::hint::spin_loop();
-            }
+fn pin(core: usize) {
+    if let Some(ids) = core_affinity::get_core_ids() {
+        if let Some(id) = ids.into_iter().find(|c| c.id == core) {
+            core_affinity::set_for_current(id);
         }
-    });
+    }
+}
+
+fn median_mops(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    samples[samples.len() / 2]
+}
+
+fn run_spsc_ring() -> f64 {
+    let (mut tx, mut rx) = spsc_ring::channel::<u64>(CAPACITY);
+    let gate = Arc::new(Barrier::new(2));
+    let producer = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            pin(PRODUCER_CORE);
+            gate.wait();
+            for i in 0..ITEMS {
+                while tx.push(i).is_err() {
+                    std::hint::spin_loop();
+                }
+            }
+        })
+    };
+    pin(CONSUMER_CORE);
+    gate.wait();
+    let start = Instant::now();
     let mut received = 0u64;
     while received < ITEMS {
         if rx.pop().is_some() {
@@ -31,20 +53,29 @@ fn spsc_ring_run() -> Duration {
             std::hint::spin_loop();
         }
     }
+    let secs = start.elapsed().as_secs_f64();
     producer.join().unwrap();
-    start.elapsed()
+    ITEMS as f64 / secs / 1e6
 }
 
-fn rtrb_run() -> Duration {
+fn run_rtrb() -> f64 {
     let (mut tx, mut rx) = rtrb::RingBuffer::<u64>::new(CAPACITY);
-    let start = Instant::now();
-    let producer = thread::spawn(move || {
-        for i in 0..ITEMS {
-            while tx.push(i).is_err() {
-                std::hint::spin_loop();
+    let gate = Arc::new(Barrier::new(2));
+    let producer = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            pin(PRODUCER_CORE);
+            gate.wait();
+            for i in 0..ITEMS {
+                while tx.push(i).is_err() {
+                    std::hint::spin_loop();
+                }
             }
-        }
-    });
+        })
+    };
+    pin(CONSUMER_CORE);
+    gate.wait();
+    let start = Instant::now();
     let mut received = 0u64;
     while received < ITEMS {
         if rx.pop().is_ok() {
@@ -53,51 +84,53 @@ fn rtrb_run() -> Duration {
             std::hint::spin_loop();
         }
     }
+    let secs = start.elapsed().as_secs_f64();
     producer.join().unwrap();
-    start.elapsed()
+    ITEMS as f64 / secs / 1e6
 }
 
-fn crossbeam_run() -> Duration {
-    let q = Arc::new(crossbeam_queue::ArrayQueue::<u64>::new(CAPACITY));
-    let start = Instant::now();
+fn run_crossbeam() -> f64 {
+    let queue = Arc::new(crossbeam_queue::ArrayQueue::<u64>::new(CAPACITY));
+    let gate = Arc::new(Barrier::new(2));
     let producer = {
-        let q = Arc::clone(&q);
+        let queue = Arc::clone(&queue);
+        let gate = Arc::clone(&gate);
         thread::spawn(move || {
+            pin(PRODUCER_CORE);
+            gate.wait();
             for i in 0..ITEMS {
-                while q.push(i).is_err() {
+                while queue.push(i).is_err() {
                     std::hint::spin_loop();
                 }
             }
         })
     };
+    pin(CONSUMER_CORE);
+    gate.wait();
+    let start = Instant::now();
     let mut received = 0u64;
     while received < ITEMS {
-        if q.pop().is_some() {
+        if queue.pop().is_some() {
             received += 1;
         } else {
             std::hint::spin_loop();
         }
     }
+    let secs = start.elapsed().as_secs_f64();
     producer.join().unwrap();
-    start.elapsed()
+    ITEMS as f64 / secs / 1e6
 }
 
-fn bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("throughput");
-    group.throughput(Throughput::Elements(ITEMS));
-
-    group.bench_function("spsc-ring", |b| {
-        b.iter_custom(|iters| (0..iters).map(|_| spsc_ring_run()).sum())
-    });
-    group.bench_function("rtrb", |b| {
-        b.iter_custom(|iters| (0..iters).map(|_| rtrb_run()).sum())
-    });
-    group.bench_function("crossbeam-ArrayQueue", |b| {
-        b.iter_custom(|iters| (0..iters).map(|_| crossbeam_run()).sum())
-    });
-
-    group.finish();
+fn report(name: &str, run: fn() -> f64) {
+    let samples = (0..RUNS).map(|_| run()).collect::<Vec<_>>();
+    println!("  {name:<22} {:8.1} Melem/s", median_mops(samples));
 }
 
-criterion_group!(benches, bench);
-criterion_main!(benches);
+fn main() {
+    println!(
+        "throughput (median of {RUNS}, {ITEMS} items, capacity {CAPACITY}, cores {PRODUCER_CORE}->{CONSUMER_CORE})"
+    );
+    report("spsc-ring", run_spsc_ring);
+    report("rtrb", run_rtrb);
+    report("crossbeam-ArrayQueue", run_crossbeam);
+}

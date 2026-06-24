@@ -20,7 +20,7 @@ fn spsc_publishes_in_order() {
         // Capacity 2 holds both items, so the producer never blocks; the consumer
         // is the only side that spins. This keeps the state space tractable while
         // still exercising the publish/consume happens-before edge.
-        let (tx, rx) = channel::<usize>(2);
+        let (mut tx, mut rx) = channel::<usize>(2);
 
         let producer = thread::spawn(move || {
             for i in 0..2 {

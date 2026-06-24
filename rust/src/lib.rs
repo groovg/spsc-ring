@@ -1,10 +1,9 @@
 //! Bounded, wait-free single-producer/single-consumer ring buffer.
 //!
-//! One thread pushes, exactly one other pops. Capacity is fixed at construction
-//! and rounded up to a power of two so the slot index is a bitmask of a free-running
-//! counter rather than a modulo.
+//! [`channel`] returns a [`Producer`] / [`Consumer`] pair that share a fixed-size
+//! buffer. Each is `Send` but not `Sync`, so the single-producer/single-consumer
+//! contract is checked at compile time.
 
-use std::cell::Cell;
 use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::ops::Deref;
@@ -16,9 +15,8 @@ mod sync {
     pub use std::sync::atomic::{AtomicUsize, Ordering};
     pub use std::sync::Arc;
 
-    /// Gives `std`'s `UnsafeCell` the same `with`/`with_mut` access API that
-    /// `loom`'s instrumented cell exposes, so the ring body is byte-for-byte the
-    /// same in the real build and under the loom model.
+    // std's UnsafeCell with the with/with_mut access API loom's cell uses, so the
+    // hot path is identical in both builds.
     #[derive(Debug)]
     pub struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
 
@@ -26,11 +24,6 @@ mod sync {
         #[inline]
         pub fn new(value: T) -> Self {
             Self(std::cell::UnsafeCell::new(value))
-        }
-
-        #[inline]
-        pub fn with<R>(&self, f: impl FnOnce(*const T) -> R) -> R {
-            f(self.0.get())
         }
 
         #[inline]
@@ -47,10 +40,6 @@ mod sync {
     pub use loom::sync::Arc;
 }
 
-/// Pads its contents to a full cache line so two fields written by different
-/// cores never land on the same line. Without this, the producer's store to
-/// `tail` and the consumer's store to `head` ping-pong the same line between
-/// cores (false sharing).
 #[repr(align(64))]
 struct CachePadded<T>(T);
 
@@ -62,27 +51,17 @@ impl<T> Deref for CachePadded<T> {
     }
 }
 
-pub struct Ring<T> {
-    slots: Box<[UnsafeCell<MaybeUninit<T>>]>,
+type Slot<T> = UnsafeCell<MaybeUninit<T>>;
+
+struct Ring<T> {
+    slots: Box<[Slot<T>]>,
     mask: usize,
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
-    // Each side caches the other index so the common case never touches the
-    // remote atomic. `head_cache` is read/written only by the producer,
-    // `tail_cache` only by the consumer — no cross-thread sharing.
-    head_cache: CachePadded<UnsafeCell<usize>>,
-    tail_cache: CachePadded<UnsafeCell<usize>>,
 }
 
-// A single producer and a single consumer touch disjoint indices, so the only
-// shared mutation is through the two atomics. T must be Send to cross the threads.
-unsafe impl<T: Send> Sync for Ring<T> {}
-unsafe impl<T: Send> Send for Ring<T> {}
-
 impl<T> Ring<T> {
-    /// Create a ring that can hold at least `capacity` elements. The real capacity
-    /// is `capacity` rounded up to the next power of two.
-    pub fn with_capacity(capacity: usize) -> Self {
+    fn with_capacity(capacity: usize) -> Self {
         assert!(capacity > 0, "capacity must be non-zero");
         let cap = capacity.next_power_of_two();
         let slots = (0..cap)
@@ -94,79 +73,12 @@ impl<T> Ring<T> {
             mask: cap - 1,
             head: CachePadded(AtomicUsize::new(0)),
             tail: CachePadded(AtomicUsize::new(0)),
-            head_cache: CachePadded(UnsafeCell::new(0)),
-            tail_cache: CachePadded(UnsafeCell::new(0)),
         }
-    }
-
-    #[inline]
-    pub fn capacity(&self) -> usize {
-        self.mask + 1
-    }
-
-    /// Push one element. Returns `Err(item)` (handing the value back) if the ring
-    /// is full.
-    ///
-    /// Only the producer writes `tail`, so its own value can be read `Relaxed`.
-    /// The free space is checked against the cached `head` first; the real `head`
-    /// atomic (loaded `Acquire`, synchronizing with the consumer's release of a
-    /// freed slot) is only read when the cache claims the ring is full. The new
-    /// `tail` is published `Release` so the element store is visible to the
-    /// consumer's matching `Acquire` load.
-    pub fn push(&self, item: T) -> Result<(), T> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let mut head = self.head_cache.with(|p| unsafe { *p });
-        if tail.wrapping_sub(head) == self.capacity() {
-            head = self.head.load(Ordering::Acquire);
-            self.head_cache.with_mut(|p| unsafe { *p = head });
-            if tail.wrapping_sub(head) == self.capacity() {
-                return Err(item);
-            }
-        }
-        self.slots[tail & self.mask].with_mut(|p| unsafe { (*p).write(item) });
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-        Ok(())
-    }
-
-    /// Pop one element. Returns `None` if the ring is empty.
-    ///
-    /// Mirror of [`push`](Self::push): `head` is the consumer's own index
-    /// (`Relaxed`), emptiness is checked against the cached `tail` first, and the
-    /// real `tail` atomic is loaded `Acquire` (observing the producer's published
-    /// element) only when the cache claims the ring is empty.
-    pub fn pop(&self) -> Option<T> {
-        let head = self.head.load(Ordering::Relaxed);
-        let mut tail = self.tail_cache.with(|p| unsafe { *p });
-        if head == tail {
-            tail = self.tail.load(Ordering::Acquire);
-            self.tail_cache.with_mut(|p| unsafe { *p = tail });
-            if head == tail {
-                return None;
-            }
-        }
-        let item = self.slots[head & self.mask].with_mut(|p| unsafe { (*p).assume_init_read() });
-        self.head.store(head.wrapping_add(1), Ordering::Release);
-        Some(item)
-    }
-
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        let tail = self.tail.load(Ordering::Acquire);
-        let head = self.head.load(Ordering::Acquire);
-        tail.wrapping_sub(head)
     }
 }
 
 impl<T> Drop for Ring<T> {
     fn drop(&mut self) {
-        // Slots in `[head, tail)` were written but never popped; drop them.
-        // Uninitialized slots are left untouched. `drop` has exclusive access, so
-        // a relaxed load of each index is enough.
         let mut head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Relaxed);
         while head != tail {
@@ -176,85 +88,132 @@ impl<T> Drop for Ring<T> {
     }
 }
 
-/// Create a ring with the given capacity and split it into the two endpoints.
-///
-/// [`Producer`] and [`Consumer`] are each `Send` but not `Sync`, so the compiler
-/// enforces the single-producer/single-consumer contract: each endpoint lives on
-/// exactly one thread.
+/// Create a ring holding at least `capacity` elements (rounded up to a power of
+/// two) and split it into its two endpoints.
 pub fn channel<T>(capacity: usize) -> (Producer<T>, Consumer<T>) {
     let ring = Arc::new(Ring::with_capacity(capacity));
-    (
-        Producer {
-            ring: Arc::clone(&ring),
-            _not_sync: PhantomData,
-        },
-        Consumer {
-            ring,
-            _not_sync: PhantomData,
-        },
-    )
+    let slots = ring.slots.as_ptr();
+    let mask = ring.mask;
+    let producer = Producer {
+        slots,
+        mask,
+        tail: 0,
+        head_cache: 0,
+        ring: Arc::clone(&ring),
+        _marker: PhantomData,
+    };
+    let consumer = Consumer {
+        slots,
+        mask,
+        head: 0,
+        tail_cache: 0,
+        ring,
+        _marker: PhantomData,
+    };
+    (producer, consumer)
 }
 
-/// The producing endpoint of a [`channel`]. Owns the sole right to `push`.
+/// The producing endpoint of a [`channel`].
 pub struct Producer<T> {
+    slots: *const Slot<T>,
+    mask: usize,
+    tail: usize,       // own index, mirrors ring.tail
+    head_cache: usize, // last observed consumer index
     ring: Arc<Ring<T>>,
-    _not_sync: PhantomData<Cell<()>>,
+    _marker: PhantomData<T>,
 }
 
-/// The consuming endpoint of a [`channel`]. Owns the sole right to `pop`.
+/// The consuming endpoint of a [`channel`].
 pub struct Consumer<T> {
+    slots: *const Slot<T>,
+    mask: usize,
+    head: usize,       // own index, mirrors ring.head
+    tail_cache: usize, // last observed producer index
     ring: Arc<Ring<T>>,
-    _not_sync: PhantomData<Cell<()>>,
+    _marker: PhantomData<T>,
 }
+
+// The raw slot pointer aliases the Arc'd buffer, which stays alive for the
+// handle's lifetime. Each handle is owned by a single thread (the raw pointer
+// keeps it !Sync); only T needs to be Send to cross threads.
+unsafe impl<T: Send> Send for Producer<T> {}
+unsafe impl<T: Send> Send for Consumer<T> {}
 
 impl<T> Producer<T> {
     /// Push one element, handing it back as `Err(item)` when the ring is full.
     #[inline]
-    pub fn push(&self, item: T) -> Result<(), T> {
-        self.ring.push(item)
+    pub fn push(&mut self, item: T) -> Result<(), T> {
+        let capacity = self.mask + 1;
+        if self.tail.wrapping_sub(self.head_cache) == capacity {
+            self.head_cache = self.ring.head.load(Ordering::Acquire);
+            if self.tail.wrapping_sub(self.head_cache) == capacity {
+                return Err(item);
+            }
+        }
+        let slot = unsafe { &*self.slots.add(self.tail & self.mask) };
+        slot.with_mut(|p| unsafe { (*p).write(item) });
+        self.tail = self.tail.wrapping_add(1);
+        self.ring.tail.store(self.tail, Ordering::Release);
+        Ok(())
     }
 
+    /// Number of elements currently queued.
     #[inline]
-    pub fn capacity(&self) -> usize {
-        self.ring.capacity()
-    }
-
-    #[inline]
-    pub fn is_full(&self) -> bool {
-        self.ring.len() == self.ring.capacity()
+    pub fn len(&self) -> usize {
+        self.tail
+            .wrapping_sub(self.ring.head.load(Ordering::Acquire))
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.ring.is_empty()
+        self.len() == 0
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
-        self.ring.len()
+    pub fn is_full(&self) -> bool {
+        self.len() == self.capacity()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.mask + 1
     }
 }
 
 impl<T> Consumer<T> {
     /// Pop one element, or `None` when the ring is empty.
     #[inline]
-    pub fn pop(&self) -> Option<T> {
-        self.ring.pop()
+    pub fn pop(&mut self) -> Option<T> {
+        if self.head == self.tail_cache {
+            self.tail_cache = self.ring.tail.load(Ordering::Acquire);
+            if self.head == self.tail_cache {
+                return None;
+            }
+        }
+        let slot = unsafe { &*self.slots.add(self.head & self.mask) };
+        let item = slot.with_mut(|p| unsafe { (*p).assume_init_read() });
+        self.head = self.head.wrapping_add(1);
+        self.ring.head.store(self.head, Ordering::Release);
+        Some(item)
     }
 
+    /// Number of elements currently available to pop.
     #[inline]
-    pub fn capacity(&self) -> usize {
-        self.ring.capacity()
+    pub fn len(&self) -> usize {
+        self.ring
+            .tail
+            .load(Ordering::Acquire)
+            .wrapping_sub(self.head)
     }
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.ring.is_empty()
+        self.len() == 0
     }
 
     #[inline]
-    pub fn len(&self) -> usize {
-        self.ring.len()
+    pub fn capacity(&self) -> usize {
+        self.mask + 1
     }
 }
 
@@ -264,118 +223,82 @@ mod tests {
 
     #[test]
     fn capacity_rounds_up_to_power_of_two() {
-        assert_eq!(Ring::<u64>::with_capacity(3).capacity(), 4);
-        assert_eq!(Ring::<u64>::with_capacity(16).capacity(), 16);
-        assert_eq!(Ring::<u64>::with_capacity(17).capacity(), 32);
+        assert_eq!(channel::<u64>(3).0.capacity(), 4);
+        assert_eq!(channel::<u64>(16).0.capacity(), 16);
+        assert_eq!(channel::<u64>(17).0.capacity(), 32);
     }
 
     #[test]
     fn push_until_full_then_pop_until_empty() {
-        let ring = Ring::<u64>::with_capacity(4);
-        assert_eq!(ring.capacity(), 4);
-        assert!(ring.is_empty());
-
+        let (mut tx, mut rx) = channel::<u64>(4);
+        assert!(rx.is_empty());
         for i in 0..4 {
-            assert!(ring.push(i).is_ok(), "push {i} should succeed");
+            assert!(tx.push(i).is_ok());
         }
-        assert_eq!(
-            ring.push(99),
-            Err(99),
-            "push into a full ring hands the value back"
-        );
-        assert_eq!(ring.len(), 4);
-
+        assert_eq!(tx.push(99), Err(99));
+        assert_eq!(tx.len(), 4);
         for i in 0..4 {
-            assert_eq!(ring.pop(), Some(i));
+            assert_eq!(rx.pop(), Some(i));
         }
-        assert_eq!(ring.pop(), None);
-        assert!(ring.is_empty());
+        assert_eq!(rx.pop(), None);
+        assert!(rx.is_empty());
     }
 
     #[test]
     fn handles_non_copy_payload() {
-        let ring = Ring::<String>::with_capacity(4);
-        assert!(ring.push("hello".to_string()).is_ok());
-        assert!(ring.push("world".to_string()).is_ok());
-        assert_eq!(ring.pop().as_deref(), Some("hello"));
-        assert_eq!(ring.pop().as_deref(), Some("world"));
-        assert!(ring.pop().is_none());
+        let (mut tx, mut rx) = channel::<String>(4);
+        assert!(tx.push("hello".to_string()).is_ok());
+        assert!(tx.push("world".to_string()).is_ok());
+        assert_eq!(rx.pop().as_deref(), Some("hello"));
+        assert_eq!(rx.pop().as_deref(), Some("world"));
+        assert!(rx.pop().is_none());
     }
 
     #[test]
     fn drops_each_element_exactly_once() {
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize as StdAtomicUsize;
+        use std::sync::Arc as StdArc;
 
-        struct Counted(Arc<AtomicUsize>);
+        struct Counted(StdArc<StdAtomicUsize>);
         impl Drop for Counted {
             fn drop(&mut self) {
                 self.0.fetch_add(1, Ordering::SeqCst);
             }
         }
 
-        let drops = Arc::new(AtomicUsize::new(0));
+        let drops = StdArc::new(StdAtomicUsize::new(0));
         {
-            let ring = Ring::<Counted>::with_capacity(8);
+            let (mut tx, mut rx) = channel::<Counted>(8);
             for _ in 0..5 {
-                assert!(ring.push(Counted(Arc::clone(&drops))).is_ok());
+                assert!(tx.push(Counted(StdArc::clone(&drops))).is_ok());
             }
-            // Two are popped (dropped here); three are left for Ring::drop.
-            drop(ring.pop().unwrap());
-            drop(ring.pop().unwrap());
+            drop(rx.pop().unwrap());
+            drop(rx.pop().unwrap());
             assert_eq!(drops.load(Ordering::SeqCst), 2);
         }
         assert_eq!(drops.load(Ordering::SeqCst), 5);
     }
 
     #[test]
-    fn single_producer_single_consumer_threads() {
-        use std::sync::Arc;
-        use std::thread;
-
-        const N: u64 = 1_000_000;
-        let ring = Arc::new(Ring::<u64>::with_capacity(1024));
-
-        let producer = {
-            let ring = Arc::clone(&ring);
-            thread::spawn(move || {
-                for i in 0..N {
-                    while ring.push(i).is_err() {
-                        std::hint::spin_loop();
-                    }
-                }
-            })
-        };
-
-        let consumer = thread::spawn(move || {
-            let mut next = 0u64;
-            while next < N {
-                match ring.pop() {
-                    Some(v) => {
-                        assert_eq!(v, next, "values must arrive in order, no gaps or dupes");
-                        next += 1;
-                    }
-                    None => std::hint::spin_loop(),
-                }
-            }
-        });
-
-        producer.join().unwrap();
-        consumer.join().unwrap();
+    fn wraps_around_the_buffer() {
+        let (mut tx, mut rx) = channel::<u64>(4);
+        for round in 0..1000 {
+            assert!(tx.push(round).is_ok());
+            assert_eq!(rx.pop(), Some(round));
+        }
+        assert!(rx.is_empty());
     }
 
     #[test]
-    fn channel_split_round_trip() {
+    fn single_producer_single_consumer_threads() {
         use std::thread;
 
-        const N: u64 = 500_000;
-        let (tx, rx) = channel::<u64>(256);
+        const N: u64 = 1_000_000;
+        let (mut tx, mut rx) = channel::<u64>(1024);
 
         let producer = thread::spawn(move || {
             for i in 0..N {
-                let mut item = i;
-                while let Err(returned) = tx.push(item) {
-                    item = returned;
+                while tx.push(i).is_err() {
                     std::hint::spin_loop();
                 }
             }
@@ -396,17 +319,5 @@ mod tests {
 
         producer.join().unwrap();
         consumer.join().unwrap();
-    }
-
-    #[test]
-    fn wraps_around_the_buffer() {
-        let ring = Ring::<u64>::with_capacity(4);
-        // Cycle through far more elements than the capacity to exercise the
-        // free-running counters wrapping over the masked index.
-        for round in 0..1000 {
-            assert!(ring.push(round).is_ok());
-            assert_eq!(ring.pop(), Some(round));
-        }
-        assert!(ring.is_empty());
     }
 }

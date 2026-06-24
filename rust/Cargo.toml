@@ -17,9 +17,10 @@ name = "spsc_ring"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 
 [dev-dependencies]
-criterion = "0.5"
 rtrb = "0.3"
 crossbeam-queue = "0.3"
+core_affinity = "0.8"
+hdrhistogram = "7"
 
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
