@@ -278,7 +278,11 @@ mod tests {
         for i in 0..4 {
             assert!(ring.push(i).is_ok(), "push {i} should succeed");
         }
-        assert_eq!(ring.push(99), Err(99), "push into a full ring hands the value back");
+        assert_eq!(
+            ring.push(99),
+            Err(99),
+            "push into a full ring hands the value back"
+        );
         assert_eq!(ring.len(), 4);
 
         for i in 0..4 {
