@@ -3,6 +3,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <utility>
 #include <vector>
 
 namespace spsc {
@@ -26,6 +27,17 @@ public:
           mask_(capacity_ - 1),
           slots_(capacity_) {}
 
+    ~Ring() {
+        // Destroy the elements still queued in [head, tail); the storage itself is
+        // freed by the slots_ vector. Uninitialized slots are left untouched.
+        std::size_t head = head_.load(std::memory_order_relaxed);
+        const std::size_t tail = tail_.load(std::memory_order_relaxed);
+        while (head != tail) {
+            slots_[head & mask_].value.~T();
+            ++head;
+        }
+    }
+
     Ring(const Ring&) = delete;
     Ring& operator=(const Ring&) = delete;
 
@@ -45,7 +57,21 @@ public:
                 return false;
             }
         }
-        slots_[tail & mask_] = item;
+        ::new (&slots_[tail & mask_].value) T(item);
+        tail_.store(tail + 1, std::memory_order_release);
+        return true;
+    }
+
+    // Overload that constructs the slot by moving from item.
+    bool push(T&& item) {
+        const std::size_t tail = tail_.load(std::memory_order_relaxed);
+        if (tail - head_cache_ == capacity_) {
+            head_cache_ = head_.load(std::memory_order_acquire);
+            if (tail - head_cache_ == capacity_) {
+                return false;
+            }
+        }
+        ::new (&slots_[tail & mask_].value) T(std::move(item));
         tail_.store(tail + 1, std::memory_order_release);
         return true;
     }
@@ -63,7 +89,9 @@ public:
                 return false;
             }
         }
-        out = slots_[head & mask_];
+        T& slot = slots_[head & mask_].value;
+        out = std::move(slot);
+        slot.~T();
         head_.store(head + 1, std::memory_order_release);
         return true;
     }
@@ -78,9 +106,18 @@ public:
     bool empty() const { return size() == 0; }
 
 private:
+    // A slot holds raw, uninitialized storage for one T. The union suppresses
+    // T's construction/destruction so we can placement-new on push and call the
+    // destructor explicitly on pop, exactly like Rust's MaybeUninit.
+    union Slot {
+        T value;
+        Slot() {}
+        ~Slot() {}
+    };
+
     std::size_t capacity_;
     std::size_t mask_;
-    std::vector<T> slots_;
+    std::vector<Slot> slots_;
 
     // head and tail live on separate cache lines: otherwise the producer's store
     // to tail and the consumer's store to head keep invalidating the same line
