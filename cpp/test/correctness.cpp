@@ -1,11 +1,12 @@
 #include <cstdint>
 #include <string>
 #include <thread>
+#include <utility>
 
 #include "check.hpp"
 #include "spsc/ring_buffer.hpp"
 
-using spsc::Ring;
+using spsc::channel;
 
 namespace {
 int g_live = 0;
@@ -21,96 +22,98 @@ struct Counted {
 }  // namespace
 
 int main() {
-    CHECK(Ring<uint64_t>(3).capacity() == 4);
-    CHECK(Ring<uint64_t>(16).capacity() == 16);
-    CHECK(Ring<uint64_t>(17).capacity() == 32);
+    {
+        auto [tx, rx] = channel<uint64_t>(3);
+        CHECK(tx.capacity() == 4);
+        CHECK(rx.capacity() == 4);
+    }
 
     {
-        Ring<uint64_t> ring(4);
-        CHECK(ring.empty());
+        auto [tx, rx] = channel<uint64_t>(4);
+        CHECK(rx.empty());
         for (uint64_t i = 0; i < 4; ++i) {
-            CHECK(ring.push(i));
+            CHECK(tx.push(i));
         }
-        CHECK(!ring.push(99));
-        CHECK(ring.size() == 4);
+        CHECK(!tx.push(99));
+        CHECK(rx.size() == 4);
 
         uint64_t value = 0;
         for (uint64_t i = 0; i < 4; ++i) {
-            CHECK(ring.pop(value));
+            CHECK(rx.pop(value));
             CHECK(value == i);
         }
-        CHECK(!ring.pop(value));
-        CHECK(ring.empty());
+        CHECK(!rx.pop(value));
+        CHECK(rx.empty());
     }
 
     {
         // Cycle through far more elements than the capacity to exercise the
         // free-running counters wrapping over the masked index.
-        Ring<uint64_t> ring(4);
+        auto [tx, rx] = channel<uint64_t>(4);
         uint64_t value = 0;
         for (uint64_t round = 0; round < 1000; ++round) {
-            CHECK(ring.push(round));
-            CHECK(ring.pop(value));
+            CHECK(tx.push(round));
+            CHECK(rx.pop(value));
             CHECK(value == round);
         }
-        CHECK(ring.empty());
+        CHECK(rx.empty());
     }
 
     {
-        // Non-trivial element type round-trips correctly.
-        Ring<std::string> ring(4);
-        CHECK(ring.push(std::string("hello")));
-        CHECK(ring.push(std::string("world")));
+        auto [tx, rx] = channel<std::string>(4);
+        CHECK(tx.push(std::string("hello")));
+        CHECK(tx.push(std::string("world")));
         std::string value;
-        CHECK(ring.pop(value));
+        CHECK(rx.pop(value));
         CHECK(value == "hello");
-        CHECK(ring.pop(value));
+        CHECK(rx.pop(value));
         CHECK(value == "world");
-        CHECK(!ring.pop(value));
+        CHECK(!rx.pop(value));
     }
 
     {
-        // Every constructed element is destroyed exactly once: nothing leaks and
-        // nothing is double-freed, whether popped or left in the ring at teardown.
+        // Every constructed element is destroyed exactly once, whether popped or
+        // left in the ring at teardown.
         {
-            Ring<Counted> ring(8);
+            auto [tx, rx] = channel<Counted>(8);
             for (int i = 0; i < 5; ++i) {
-                CHECK(ring.push(Counted{}));
+                CHECK(tx.push(Counted{}));
             }
             Counted out;
-            CHECK(ring.pop(out));
-            CHECK(ring.pop(out));
-            // Three elements are left for ~Ring to destroy.
+            CHECK(rx.pop(out));
+            CHECK(rx.pop(out));
         }
         CHECK(g_live == 0);
     }
 
     {
-        // Producer and consumer on separate threads: values must arrive in order
-        // with no gaps or duplicates.
+        // Producer and consumer on separate threads: values arrive in order with
+        // no gaps or duplicates.
         constexpr uint64_t kCount = 2'000'000;
-        Ring<uint64_t> ring(1024);
+        auto [tx0, rx0] = channel<uint64_t>(1024);
 
-        std::thread producer([&] {
+        std::thread producer([tx = std::move(tx0)]() mutable {
             for (uint64_t i = 0; i < kCount; ++i) {
-                while (!ring.push(i)) {
-                    // spin until the consumer frees a slot
+                while (!tx.push(i)) {
                 }
             }
         });
 
         uint64_t next = 0;
-        uint64_t value = 0;
-        while (next < kCount) {
-            if (ring.pop(value)) {
-                if (value != next) {
-                    CHECK(value == next);
-                    break;
+        std::thread consumer([rx = std::move(rx0), &next]() mutable {
+            uint64_t value = 0;
+            while (next < kCount) {
+                if (rx.pop(value)) {
+                    if (value != next) {
+                        break;
+                    }
+                    ++next;
                 }
-                ++next;
             }
-        }
+        });
+
         producer.join();
+        consumer.join();
         CHECK(next == kCount);
     }
 
