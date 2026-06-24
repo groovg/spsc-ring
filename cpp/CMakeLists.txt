@@ -21,3 +21,23 @@ add_executable(correctness test/correctness.cpp)
 target_link_libraries(correctness PRIVATE spsc_ring Threads::Threads)
 target_compile_options(correctness PRIVATE -Wall -Wextra)
 add_test(NAME correctness COMMAND correctness)
+
+# Benchmarks pull in rigtorp::SPSCQueue for comparison, so they need network at
+# configure time. Turn them off with -DSPSC_BUILD_BENCHMARKS=OFF when offline.
+option(SPSC_BUILD_BENCHMARKS "Build the benchmarks (fetches rigtorp::SPSCQueue)" ON)
+
+if(SPSC_BUILD_BENCHMARKS)
+    include(FetchContent)
+    FetchContent_Declare(
+        rigtorp_spsc
+        GIT_REPOSITORY https://github.com/rigtorp/SPSCQueue.git
+        GIT_TAG v1.1
+    )
+    FetchContent_MakeAvailable(rigtorp_spsc)
+
+    foreach(bench throughput latency_rtt)
+        add_executable(${bench} bench/${bench}.cpp)
+        target_link_libraries(${bench} PRIVATE spsc_ring SPSCQueue Threads::Threads)
+        target_compile_options(${bench} PRIVATE -O3 -march=native)
+    endforeach()
+endif()
