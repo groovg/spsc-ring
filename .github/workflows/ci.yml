@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - name: loom (exhaustive interleavings)
+        run: RUSTFLAGS="--cfg loom" cargo test --release --test loom
+
+  cpp:
+    name: C++
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cpp
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build and test
+        run: |
+          cmake -S . -B build -G Ninja -DSPSC_BUILD_BENCHMARKS=OFF
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+      - name: ThreadSanitizer
+        run: |
+          g++ -std=c++20 -O1 -g -pthread -fsanitize=thread -Iinclude test/correctness.cpp -o tsan
+          ./tsan
+      - name: Address + UB Sanitizer
+        run: |
+          g++ -std=c++20 -O1 -g -pthread -fsanitize=address,undefined -Iinclude test/correctness.cpp -o asan
+          ./asan

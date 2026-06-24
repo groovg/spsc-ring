@@ -1,5 +1,7 @@
 # spsc-ring
 
+[![CI](https://github.com/groovg/spsc-ring/actions/workflows/ci.yml/badge.svg)](https://github.com/groovg/spsc-ring/actions/workflows/ci.yml)
+
 A bounded, wait-free **single-producer / single-consumer** ring buffer, implemented twice —
 once in **Rust** and once in **C++20** — so the two can be compared directly.
 
