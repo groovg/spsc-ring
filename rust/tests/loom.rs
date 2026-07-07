@@ -15,6 +15,33 @@ use loom::thread;
 use spsc_ring::channel;
 
 #[test]
+fn batch_publish_wraps_and_stays_ordered() {
+    loom::model(|| {
+        let (mut tx, mut rx) = channel::<usize>(2);
+        // Advance both indices so the batch below straddles the wrap point.
+        tx.push(9).expect("empty ring");
+        assert_eq!(rx.pop(), Some(9));
+
+        let producer = thread::spawn(move || {
+            assert_eq!(tx.push_slice(&[1, 2]), 2);
+        });
+
+        let mut got = Vec::new();
+        let mut buf = [0usize; 2];
+        while got.len() < 2 {
+            let n = rx.pop_slice(&mut buf);
+            got.extend_from_slice(&buf[..n]);
+            if n == 0 {
+                loom::thread::yield_now();
+            }
+        }
+
+        producer.join().unwrap();
+        assert_eq!(got, [1, 2]);
+    });
+}
+
+#[test]
 fn spsc_publishes_in_order() {
     loom::model(|| {
         // Capacity 2 holds both items, so the producer never blocks; the consumer

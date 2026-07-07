@@ -18,6 +18,7 @@ mod sync {
     // std's UnsafeCell with the with/with_mut access API loom's cell uses, so the
     // hot path is identical in both builds.
     #[derive(Debug)]
+    #[repr(transparent)]
     pub struct UnsafeCell<T>(std::cell::UnsafeCell<T>);
 
     impl<T> UnsafeCell<T> {
@@ -164,6 +165,41 @@ impl<T> Producer<T> {
             .wrapping_sub(self.ring.head.load(Ordering::Acquire))
     }
 
+    /// Copy as many leading elements of `items` as fit, returning how many were
+    /// pushed. The whole batch is published with a single release store.
+    pub fn push_slice(&mut self, items: &[T]) -> usize
+    where
+        T: Copy,
+    {
+        let capacity = self.mask + 1;
+        let mut free = capacity - self.tail.wrapping_sub(self.head_cache);
+        if free < items.len() {
+            self.head_cache = self.ring.head.load(Ordering::Acquire);
+            free = capacity - self.tail.wrapping_sub(self.head_cache);
+        }
+        let n = items.len().min(free);
+        // Two contiguous spans around the wrap point; Slot<T> is layout-transparent
+        // over T. Under loom the copy goes through the modelled cells instead.
+        #[cfg(not(loom))]
+        unsafe {
+            let base = self.slots as *mut Slot<T> as *mut T;
+            let start = self.tail & self.mask;
+            let first = n.min(self.mask + 1 - start);
+            std::ptr::copy_nonoverlapping(items.as_ptr(), base.add(start), first);
+            std::ptr::copy_nonoverlapping(items.as_ptr().add(first), base, n - first);
+        }
+        #[cfg(loom)]
+        for (i, &item) in items[..n].iter().enumerate() {
+            let slot = unsafe { &*self.slots.add(self.tail.wrapping_add(i) & self.mask) };
+            slot.with_mut(|p| unsafe { (*p).write(item) });
+        }
+        if n > 0 {
+            self.tail = self.tail.wrapping_add(n);
+            self.ring.tail.store(self.tail, Ordering::Release);
+        }
+        n
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -195,6 +231,38 @@ impl<T> Consumer<T> {
         self.head = self.head.wrapping_add(1);
         self.ring.head.store(self.head, Ordering::Release);
         Some(item)
+    }
+
+    /// Copy up to `out.len()` elements into `out`, returning how many were
+    /// popped. The whole batch is released with a single store.
+    pub fn pop_slice(&mut self, out: &mut [T]) -> usize
+    where
+        T: Copy,
+    {
+        let mut avail = self.tail_cache.wrapping_sub(self.head);
+        if avail < out.len() {
+            self.tail_cache = self.ring.tail.load(Ordering::Acquire);
+            avail = self.tail_cache.wrapping_sub(self.head);
+        }
+        let n = out.len().min(avail);
+        #[cfg(not(loom))]
+        unsafe {
+            let base = self.slots as *const T;
+            let start = self.head & self.mask;
+            let first = n.min(self.mask + 1 - start);
+            std::ptr::copy_nonoverlapping(base.add(start), out.as_mut_ptr(), first);
+            std::ptr::copy_nonoverlapping(base, out.as_mut_ptr().add(first), n - first);
+        }
+        #[cfg(loom)]
+        for (i, out_slot) in out[..n].iter_mut().enumerate() {
+            let slot = unsafe { &*self.slots.add(self.head.wrapping_add(i) & self.mask) };
+            *out_slot = slot.with_mut(|p| unsafe { (*p).assume_init_read() });
+        }
+        if n > 0 {
+            self.head = self.head.wrapping_add(n);
+            self.ring.head.store(self.head, Ordering::Release);
+        }
+        n
     }
 
     /// Number of elements currently available to pop.
@@ -287,6 +355,76 @@ mod tests {
             assert_eq!(rx.pop(), Some(round));
         }
         assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn slice_roundtrip_with_wrap() {
+        let (mut tx, mut rx) = channel::<u64>(4);
+        assert!(tx.push(0).is_ok());
+        assert_eq!(rx.pop(), Some(0));
+
+        assert_eq!(tx.push_slice(&[1, 2, 3, 4, 5]), 4);
+        assert_eq!(tx.push_slice(&[9]), 0);
+        let mut buf = [0u64; 8];
+        assert_eq!(rx.pop_slice(&mut buf), 4);
+        assert_eq!(&buf[..4], &[1, 2, 3, 4]);
+        assert_eq!(rx.pop_slice(&mut buf), 0);
+        assert_eq!(tx.push_slice(&[]), 0);
+    }
+
+    #[test]
+    fn slices_interleave_with_single_ops() {
+        let (mut tx, mut rx) = channel::<u64>(8);
+        assert!(tx.push(1).is_ok());
+        assert_eq!(tx.push_slice(&[2, 3, 4]), 3);
+        assert_eq!(rx.pop(), Some(1));
+        let mut buf = [0u64; 2];
+        assert_eq!(rx.pop_slice(&mut buf), 2);
+        assert_eq!(buf, [2, 3]);
+        assert_eq!(rx.pop(), Some(4));
+        assert!(rx.is_empty());
+    }
+
+    #[test]
+    fn slice_stress_across_threads() {
+        use std::thread;
+
+        const N: u64 = 1_000_000;
+        let (mut tx, mut rx) = channel::<u64>(1024);
+
+        let producer = thread::spawn(move || {
+            let mut next = 0u64;
+            let mut chunk = [0u64; 64];
+            while next < N {
+                let want = ((N - next).min(64)) as usize;
+                for (i, c) in chunk[..want].iter_mut().enumerate() {
+                    *c = next + i as u64;
+                }
+                let mut sent = 0;
+                while sent < want {
+                    let pushed = tx.push_slice(&chunk[sent..want]);
+                    if pushed == 0 {
+                        std::hint::spin_loop();
+                    }
+                    sent += pushed;
+                }
+                next += want as u64;
+            }
+        });
+
+        let mut expected = 0u64;
+        let mut buf = [0u64; 64];
+        while expected < N {
+            let n = rx.pop_slice(&mut buf);
+            for &v in &buf[..n] {
+                assert_eq!(v, expected);
+                expected += 1;
+            }
+            if n == 0 {
+                std::hint::spin_loop();
+            }
+        }
+        producer.join().unwrap();
     }
 
     #[test]
