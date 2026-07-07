@@ -3,6 +3,7 @@
 #include <atomic>
 #include <bit>
 #include <cstddef>
+#include <cstring>
 #include <memory>
 #include <type_traits>
 #include <utility>
@@ -84,6 +85,31 @@ public:
     bool push(const T& item) { return emplace(item); }
     bool push(T&& item) { return emplace(std::move(item)); }
 
+    // Copy as many leading items as fit, publishing the whole batch with a single
+    // release store. Returns the number pushed.
+    std::size_t push_n(const T* items, std::size_t count) {
+        static_assert(std::is_trivially_copyable_v<T>,
+                      "push_n requires a trivially copyable T; use push");
+        static_assert(sizeof(detail::Slot<T>) == sizeof(T));
+        const std::size_t capacity = mask_ + 1;
+        std::size_t free = capacity - (tail_ - head_cache_);
+        if (free < count) {
+            head_cache_ = ring_->head_idx.load(std::memory_order_acquire);
+            free = capacity - (tail_ - head_cache_);
+        }
+        const std::size_t n = count < free ? count : free;
+        if (n == 0) {
+            return 0;
+        }
+        const std::size_t start = tail_ & mask_;
+        const std::size_t first = n < capacity - start ? n : capacity - start;
+        std::memcpy(&base_[start].value, items, first * sizeof(T));
+        std::memcpy(&base_[0].value, items + first, (n - first) * sizeof(T));
+        tail_ += n;
+        ring_->tail_idx.store(tail_, std::memory_order_release);
+        return n;
+    }
+
     std::size_t capacity() const { return mask_ + 1; }
     std::size_t size() const { return tail_ - ring_->head_idx.load(std::memory_order_acquire); }
     bool full() const { return size() == capacity(); }
@@ -140,6 +166,31 @@ public:
         head_ += 1;
         ring_->head_idx.store(head_, std::memory_order_release);
         return true;
+    }
+
+    // Copy up to `count` items into out, releasing the whole batch with a single
+    // store. Returns the number popped.
+    std::size_t pop_n(T* out, std::size_t count) {
+        static_assert(std::is_trivially_copyable_v<T>,
+                      "pop_n requires a trivially copyable T; use pop");
+        static_assert(sizeof(detail::Slot<T>) == sizeof(T));
+        std::size_t avail = tail_cache_ - head_;
+        if (avail < count) {
+            tail_cache_ = ring_->tail_idx.load(std::memory_order_acquire);
+            avail = tail_cache_ - head_;
+        }
+        const std::size_t n = count < avail ? count : avail;
+        if (n == 0) {
+            return 0;
+        }
+        const std::size_t capacity = mask_ + 1;
+        const std::size_t start = head_ & mask_;
+        const std::size_t first = n < capacity - start ? n : capacity - start;
+        std::memcpy(out, &base_[start].value, first * sizeof(T));
+        std::memcpy(out + first, &base_[0].value, (n - first) * sizeof(T));
+        head_ += n;
+        ring_->head_idx.store(head_, std::memory_order_release);
+        return n;
     }
 
     std::size_t capacity() const { return mask_ + 1; }
