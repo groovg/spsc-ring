@@ -78,29 +78,36 @@ C++20 is the baseline the header targets, on purpose:
 ## Benchmarks
 
 Measured on an **AMD Ryzen 9 9950X3D** (16C/32T), Windows 11, gcc 16.1 (`-O3 -march=native`)
-and rustc 1.95 (LTO). Both threads are pinned to two physical cores on the same CCD; the
-channel allocation and thread spawn happen outside the timed region. Numbers vary a few percent
-run-to-run on a non-isolated desktop, but each implementation consistently leads its reference
-within a run.
+and rustc 1.95 (LTO + `target-cpu=native` via the repo's cargo config). Both threads are
+pinned to two physical cores on the same CCD; the channel allocation and thread spawn happen
+outside the timed region. Numbers vary a few percent run-to-run on a non-isolated desktop.
 
 **Throughput** — sustained two-thread `u64` hand-off, capacity 1024, median of 15 runs:
 
 | Implementation                         | Throughput |
 |----------------------------------------|-----------:|
-| `spsc_ring::channel` (this repo, Rust) | **~1430 Melem/s** |
-| `rtrb` (Rust)                          | ~1110 Melem/s |
-| `crossbeam::ArrayQueue` (Rust, MPMC)   | ~120 Melem/s |
-| `spsc::Ring` (this repo, C++)          | **~1030 Melem/s** |
-| `rigtorp::SPSCQueue` (C++)             | ~690 Melem/s |
+| `spsc_ring` push_slice/pop_slice(64) (Rust) | **~4860 Melem/s** |
+| `rtrb` chunk(64), in-place fill (Rust) | ~7500 Melem/s |
+| `rtrb` chunk(64), staged like a slice (Rust) | ~2300 Melem/s |
+| `spsc_ring::channel` single-op (Rust)  | **~1870 Melem/s** |
+| `rtrb` single-op (Rust)                | ~1115 Melem/s |
+| `crossbeam::ArrayQueue` (Rust, MPMC)   | ~90 Melem/s |
+| `spsc::Ring` push_n/pop_n(64) (C++)    | **~2010 Melem/s** |
+| `spsc::Ring` single-op (C++)           | **~1175 Melem/s** |
+| `rigtorp::SPSCQueue` (C++, no batch API) | ~705 Melem/s |
 
 **Ping-pong round-trip latency** — mean over 2M rounds (halve for one-way hand-off):
 
 | Implementation                         | RTT (mean) |
 |----------------------------------------|-----------:|
-| `spsc_ring::channel` (this repo, Rust) | **~94 ns** |
-| `rtrb` (Rust)                          | ~108 ns |
-| `spsc::Ring` (this repo, C++)          | **~112 ns** |
-| `rigtorp::SPSCQueue` (C++)             | ~149 ns |
+| `spsc_ring::channel` (this repo, Rust) | ~103–114 ns |
+| `rtrb` (Rust)                          | ~104–118 ns |
+| `spsc::Ring` (this repo, C++)          | **~118 ns** |
+| `rigtorp::SPSCQueue` (C++)             | ~144 ns |
+
+Round-trip latency between this ring and `rtrb` is a statistical tie on this box — the
+leader flips between runs, so the honest read is a range, not a winner. The C++ ring's
+lead over `rigtorp` is stable across runs.
 
 ### Why it's faster — and the tradeoff that buys it
 
@@ -120,10 +127,33 @@ These numbers come from a deliberate design choice, not from `rtrb`/`rigtorp` be
 
 So the honest summary is: **faster on a fixed, power-of-two ring, at the cost of flexibility.**
 `rtrb` and `rigtorp` take any capacity, ship allocator hooks, and offer richer APIs (`rtrb`'s
-batched `write_chunk`/`read_chunk`, `rigtorp`'s `peek`); this library trades those away for the
-leanest possible fixed-size hot path. Every contender is driven through its own idiomatic API and
-built with full optimization (LTO / `-O3 -march=native`), with identical pinning and steady-state
-timing.
+in-place chunks, `rigtorp`'s `peek`); this library trades those away for the leanest possible
+fixed-size hot path. Every contender is driven through its own idiomatic API and built with
+full optimization (LTO / `-O3 -march=native`), with identical pinning and steady-state timing.
+
+### The batch API and what the rtrb chunk rows mean
+
+`push_slice`/`pop_slice` (Rust, `T: Copy`) and `push_n`/`pop_n` (C++, trivially copyable)
+amortize the per-element costs across a batch: one full/empty check, one release store to
+publish the whole span, and the payload moved as two contiguous `memcpy` spans around the
+wrap point. That is worth ~2.6× over single-op in Rust and ~1.7× in C++ here.
+
+The two `rtrb` chunk rows are the same comparison run both ways, because the APIs have
+different shapes and pretending otherwise would be a benchmark sin:
+
+- **staged** — values are prepared in a local buffer and then copied in, i.e. exactly the
+  data movement a slice API performs. At equal work this ring's `push_slice` leads ~2×
+  (raw span copies + a single release vs `rtrb`'s per-item iterator fill).
+- **in-place** — `rtrb`'s `write_chunk_uninit` lets the producer construct values directly
+  in ring memory, skipping the staging pass entirely. No slice API can express that, and
+  it wins decisively when the producer can generate in place. If your producer builds
+  payloads from scratch (rather than forwarding a buffer that already exists — the typical
+  market-data case), `rtrb`'s chunk API is the right shape and this table says so.
+
+The consumer side copies out in all rows, so read paths are like-for-like (`rtrb` also
+offers a zero-copy read view this library doesn't). The C++ batch trails the Rust batch
+(~2.0 vs ~4.9 Gelem/s) with the same algorithm; the residual is GCC-vs-LLVM code
+generation on this Windows box and is parked for a profiling session on Linux.
 
 > Cross-language rows aren't directly comparable (different timer paths and run conditions);
 > read each implementation against its own-language reference. RTT percentiles are reported by
@@ -136,10 +166,10 @@ Being honest about where this trails the reference crates:
 
 - **Power-of-two capacity only.** That restriction is what buys the branchless index math; if
   arbitrary capacity were a requirement, the right move is `rtrb`/`rigtorp`, not this.
-- **No batch / chunk API yet.** `rtrb`'s `write_chunk`/`read_chunk` are both a flexibility and a
-  throughput win — a `push_n`/`pop_n` here that reserves a contiguous span and `memcpy`s the
-  payloads would amortize the publish/observe round trip across many elements (the next lever,
-  and a natural fit for bursty market-data fan-out).
+- **The batch API is slice-based (it copies).** There is deliberately no reserve-style
+  uninit-chunk API for constructing values in place — that is `rtrb`'s territory and the
+  benchmark above quantifies exactly what the simpler API shape costs. Batch ops also
+  require `Copy` / trivially copyable payloads; single-op push/pop handle everything else.
 - **No custom allocator / NUMA placement**, which the references expose.
 - **Measure on isolated hardware.** These numbers are from a shared Windows desktop; real tail
   latency wants `isolcpus` / `nohz_full` on Linux and a TSC-based timer for honest p99.9.

@@ -26,8 +26,9 @@ while received < 1000 {
 `channel` returns a `Producer` / `Consumer` pair. Each is `Send` but not `Sync`, so
 the single-producer/single-consumer contract is enforced at compile time. `push`
 hands the value back as `Err(item)` when the ring is full; `pop` returns `None`
-when empty. Capacity is rounded up to a power of two and nothing allocates after
-construction.
+when empty. For `T: Copy`, `push_slice`/`pop_slice` move a whole batch with a
+single release store per call. Capacity is rounded up to a power of two and
+nothing allocates after construction.
 
 ## Design
 

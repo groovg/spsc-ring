@@ -23,7 +23,9 @@ while (rx.pop(value)) {
 ```
 
 `channel<T>(capacity)` returns a `Producer` / `Consumer` pair (move-only, one per
-thread). `push` returns `false` when full, `pop` returns `false` when empty.
+thread). `push` returns `false` when full, `pop` returns `false` when empty. For
+trivially copyable `T`, `push_n`/`pop_n` move a whole batch with a single release
+store per call.
 Capacity is rounded up to a power of two and nothing allocates after construction.
 
 ## Design
