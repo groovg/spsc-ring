@@ -96,18 +96,21 @@ outside the timed region. Numbers vary a few percent run-to-run on a non-isolate
 | `spsc::Ring` single-op (C++)           | **~1175 Melem/s** |
 | `rigtorp::SPSCQueue` (C++, no batch API) | ~705 Melem/s |
 
-**Ping-pong round-trip latency** — mean over 2M rounds (halve for one-way hand-off):
+**Ping-pong round-trip latency** — 2M rounds (halve for one-way hand-off):
 
-| Implementation                         | RTT (mean) |
-|----------------------------------------|-----------:|
-| `spsc_ring::channel` (this repo, Rust) | ~103–114 ns |
-| `rtrb` (Rust)                          | ~104–118 ns |
-| `spsc::Ring` (this repo, C++)          | **~118 ns** |
-| `rigtorp::SPSCQueue` (C++)             | ~144 ns |
+| Implementation                         | p50 | p99 | mean |
+|----------------------------------------|----:|----:|-----:|
+| `spsc::Ring` (this repo, C++)          | **~115 ns** | **~160 ns** | ~118 ns |
+| `rigtorp::SPSCQueue` (C++)             | ~145 ns | ~175 ns | ~150 ns |
+| `spsc_ring::channel` (this repo, Rust) | — | — | ~103–114 ns |
+| `rtrb` (Rust)                          | — | — | ~104–118 ns |
 
-Round-trip latency between this ring and `rtrb` is a statistical tie on this box — the
-leader flips between runs, so the honest read is a range, not a winner. The C++ ring's
-lead over `rigtorp` is stable across runs.
+The C++ bench stamps each round trip with
+[tsc-latency](https://github.com/groovg/tsc-latency)'s fenced RDTSC pair, so its
+percentiles are real. The Rust bench still uses `std::time::Instant`, which on Windows
+quantizes at ~100 ns — only its means are meaningful, and by those this ring and `rtrb`
+are a statistical tie (the leader flips between runs). The C++ ring's lead over
+`rigtorp` is stable across runs and now visible at every percentile.
 
 ### Why it's faster — and the tradeoff that buys it
 
@@ -156,9 +159,9 @@ offers a zero-copy read view this library doesn't). The C++ batch trails the Rus
 generation on this Windows box and is parked for a profiling session on Linux.
 
 > Cross-language rows aren't directly comparable (different timer paths and run conditions);
-> read each implementation against its own-language reference. RTT percentiles are reported by
-> the benches but the Windows `steady_clock` granularity (~100 ns) quantizes per-op samples, so
-> the mean is the meaningful figure here — sub-100 ns tail detail needs a TSC-based clock.
+> read each implementation against its own-language reference. The C++ RTT bench is
+> TSC-timed; the Rust one still samples `Instant` at ~100 ns Windows granularity, which is
+> why its rows carry means only.
 
 ## Limitations and what I'd add next
 

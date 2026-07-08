@@ -34,10 +34,15 @@ if(SPSC_BUILD_BENCHMARKS)
         GIT_TAG v1.1
     )
     FetchContent_MakeAvailable(rigtorp_spsc)
+    FetchContent_Declare(
+        tsc_latency
+        GIT_REPOSITORY https://github.com/groovg/tsc-latency.git
+        GIT_TAG 8b432562323a9c2c5f9f54064d7c1127139daa4c)
+    FetchContent_MakeAvailable(tsc_latency)
 
     foreach(bench throughput latency_rtt)
         add_executable(${bench} bench/${bench}.cpp)
-        target_link_libraries(${bench} PRIVATE spsc_ring SPSCQueue Threads::Threads)
+        target_link_libraries(${bench} PRIVATE spsc_ring SPSCQueue tsclat Threads::Threads)
         target_compile_options(${bench} PRIVATE -O3 -march=native)
     endforeach()
 endif()
