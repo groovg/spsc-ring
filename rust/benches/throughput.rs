@@ -10,6 +10,7 @@ use std::time::Instant;
 
 const ITEMS: u64 = 50_000_000;
 const CAPACITY: usize = 1024;
+const BATCH: usize = 64;
 const PRODUCER_CORE: usize = 0;
 const CONSUMER_CORE: usize = 2;
 const RUNS: usize = 15;
@@ -52,6 +53,143 @@ fn run_spsc_ring() -> f64 {
         } else {
             std::hint::spin_loop();
         }
+    }
+    let secs = start.elapsed().as_secs_f64();
+    producer.join().unwrap();
+    ITEMS as f64 / secs / 1e6
+}
+
+fn run_spsc_ring_batch() -> f64 {
+    let (mut tx, mut rx) = spsc_ring::channel::<u64>(CAPACITY);
+    let gate = Arc::new(Barrier::new(2));
+    let producer = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            pin(PRODUCER_CORE);
+            gate.wait();
+            let mut chunk = [0u64; BATCH];
+            let mut next = 0u64;
+            while next < ITEMS {
+                let want = ((ITEMS - next) as usize).min(BATCH);
+                for (i, c) in chunk[..want].iter_mut().enumerate() {
+                    *c = next + i as u64;
+                }
+                let mut sent = 0;
+                while sent < want {
+                    let n = tx.push_slice(&chunk[sent..want]);
+                    if n == 0 {
+                        std::hint::spin_loop();
+                    }
+                    sent += n;
+                }
+                next += want as u64;
+            }
+        })
+    };
+    pin(CONSUMER_CORE);
+    gate.wait();
+    let start = Instant::now();
+    let mut received = 0u64;
+    let mut buf = [0u64; BATCH];
+    while received < ITEMS {
+        let n = rx.pop_slice(&mut buf);
+        if n == 0 {
+            std::hint::spin_loop();
+        }
+        received += n as u64;
+    }
+    let secs = start.elapsed().as_secs_f64();
+    producer.join().unwrap();
+    ITEMS as f64 / secs / 1e6
+}
+
+// Same data movement as the slice API: values staged in a local buffer first.
+fn run_rtrb_chunk_staged() -> f64 {
+    let (mut tx, mut rx) = rtrb::RingBuffer::<u64>::new(CAPACITY);
+    let gate = Arc::new(Barrier::new(2));
+    let producer = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            pin(PRODUCER_CORE);
+            gate.wait();
+            let mut next = 0u64;
+            while next < ITEMS {
+                let want = ((ITEMS - next) as usize).min(BATCH).min(tx.slots());
+                if want == 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let mut staged = [0u64; BATCH];
+                for (i, s) in staged[..want].iter_mut().enumerate() {
+                    *s = next + i as u64;
+                }
+                let chunk = tx.write_chunk_uninit(want).unwrap();
+                next += chunk.fill_from_iter(staged[..want].iter().copied()) as u64;
+            }
+        })
+    };
+    pin(CONSUMER_CORE);
+    gate.wait();
+    let start = Instant::now();
+    let mut received = 0u64;
+    let mut buf = [0u64; BATCH];
+    while received < ITEMS {
+        let want = rx.slots().min(BATCH);
+        if want == 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let chunk = rx.read_chunk(want).unwrap();
+        let (a, b) = chunk.as_slices();
+        buf[..a.len()].copy_from_slice(a);
+        buf[a.len()..a.len() + b.len()].copy_from_slice(b);
+        received += (a.len() + b.len()) as u64;
+        chunk.commit_all();
+    }
+    let secs = start.elapsed().as_secs_f64();
+    producer.join().unwrap();
+    ITEMS as f64 / secs / 1e6
+}
+
+// rtrb's idiomatic chunk use: values are constructed directly in the ring, no
+// staging pass. A slice API cannot express this; see the README tradeoff note.
+fn run_rtrb_chunk_inplace() -> f64 {
+    let (mut tx, mut rx) = rtrb::RingBuffer::<u64>::new(CAPACITY);
+    let gate = Arc::new(Barrier::new(2));
+    let producer = {
+        let gate = Arc::clone(&gate);
+        thread::spawn(move || {
+            pin(PRODUCER_CORE);
+            gate.wait();
+            let mut next = 0u64;
+            while next < ITEMS {
+                let want = ((ITEMS - next) as usize).min(BATCH).min(tx.slots());
+                if want == 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let chunk = tx.write_chunk_uninit(want).unwrap();
+                next += chunk.fill_from_iter(next..) as u64;
+            }
+        })
+    };
+    pin(CONSUMER_CORE);
+    gate.wait();
+    let start = Instant::now();
+    let mut received = 0u64;
+    let mut buf = [0u64; BATCH];
+    while received < ITEMS {
+        let want = rx.slots().min(BATCH);
+        if want == 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let chunk = rx.read_chunk(want).unwrap();
+        let (a, b) = chunk.as_slices();
+        buf[..a.len()].copy_from_slice(a);
+        buf[a.len()..a.len() + b.len()].copy_from_slice(b);
+        received += (a.len() + b.len()) as u64;
+        chunk.commit_all();
     }
     let secs = start.elapsed().as_secs_f64();
     producer.join().unwrap();
@@ -131,6 +269,9 @@ fn main() {
         "throughput (median of {RUNS}, {ITEMS} items, capacity {CAPACITY}, cores {PRODUCER_CORE}->{CONSUMER_CORE})"
     );
     report("spsc-ring", run_spsc_ring);
+    report("spsc-ring batch(64)", run_spsc_ring_batch);
     report("rtrb", run_rtrb);
+    report("rtrb chunk(64) staged", run_rtrb_chunk_staged);
+    report("rtrb chunk(64) in-place", run_rtrb_chunk_inplace);
     report("crossbeam-ArrayQueue", run_crossbeam);
 }
